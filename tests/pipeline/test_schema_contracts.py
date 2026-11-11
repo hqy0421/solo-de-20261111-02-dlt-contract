@@ -1,5 +1,6 @@
 import dlt, pytest
 import contextlib
+import os
 from typing import Any, Callable, ClassVar, Dict, Iterator, Literal, Union, Optional, Type, cast
 
 from dlt.common import Decimal
@@ -1152,6 +1153,54 @@ def test_replace_contract_discard_all_rows_truncates() -> None:
     assert load_table_counts(pipeline).get("items", 0) == 0
     # the new column was blocked by the contract
     assert "extra" not in pipeline.default_schema.get_table("items")["columns"]
+
+
+def test_discard_row_rejects_whole_business_record() -> None:
+    """With `reject_item_on_discard_row` enabled, an order whose root or any detail row violates
+    a `discard_row` contract is rejected with all its table rows. Valid orders load and columns
+    discovered through rejected orders do not enter the schema."""
+    os.environ["NORMALIZE__REJECT_ITEM_ON_DISCARD_ROW"] = "true"
+    pipeline = get_pipeline()
+
+    @dlt.resource(name="orders", schema_contract={"columns": "discard_row"})
+    def orders(data: Any) -> Any:
+        yield from data
+
+    # run 1: establish the schema with valid orders
+    info = pipeline.run(
+        orders(
+            [
+                {"id": 1, "items": [{"sku": "a"}]},
+                {"id": 2, "items": [{"sku": "b"}]},
+            ]
+        )
+    )
+    assert_load_info(info)
+    assert load_table_counts(pipeline, "orders", "orders__items") == {
+        "orders": 2,
+        "orders__items": 2,
+    }
+
+    # run 2: order 4 violates on the root record, order 5 on a detail record
+    info = pipeline.run(
+        orders(
+            [
+                {"id": 3, "items": [{"sku": "c"}]},
+                {"id": 4, "customer": "x", "items": [{"sku": "d"}]},
+                {"id": 5, "items": [{"sku": "e", "qty": 1}]},
+            ]
+        )
+    )
+    assert_load_info(info)
+    assert load_table_counts(pipeline, "orders", "orders__items") == {
+        "orders": 3,
+        "orders__items": 3,
+    }
+    with pipeline.sql_client() as client:
+        loaded_ids = {row[0] for row in client.execute_sql("SELECT id FROM orders")}
+    assert loaded_ids == {1, 2, 3}
+    assert "customer" not in pipeline.default_schema.get_table("orders")["columns"]
+    assert "qty" not in pipeline.default_schema.get_table("orders__items")["columns"]
 
 
 def test_upsert_contract_discard_all_rows_never_seen_table_not_verified() -> None:

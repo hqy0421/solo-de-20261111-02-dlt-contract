@@ -15,6 +15,7 @@ from dlt.common.runners.configuration import PoolRunnerConfiguration
 from dlt.common.runners.pool_runner import NullExecutor, create_pool
 from dlt.common.schema.exceptions import CannotCoerceColumnException
 from dlt.common.schema.schema import Schema
+from dlt.common.schema.typing import TSchemaContract
 from dlt.common.schema.utils import new_table
 from dlt.common.storages.exceptions import SchemaNotFoundError
 from dlt.common.typing import StrAny
@@ -74,6 +75,13 @@ def caps(request) -> Iterator[DestinationCapabilitiesContext]:
 def raw_normalize() -> Iterator[Normalize]:
     # does not install default schemas, so no type hints and row filters
     # uses default json normalizer that does not yield additional rasa tables
+    yield from init_normalize()
+
+
+@pytest.fixture()
+def raw_normalize_reject_item() -> Iterator[Normalize]:
+    # rejects whole data items when any of their rows violates a `discard_row` contract rule
+    os.environ["NORMALIZE__REJECT_ITEM_ON_DISCARD_ROW"] = "true"
     yield from init_normalize()
 
 
@@ -505,6 +513,296 @@ def test_normalize_contract_discard_all_rows(
         # never-seen table is not materialized: no job is produced for it
         files = raw_normalize.load_storage.list_new_jobs(load_id) if load_id in normalized else []
         assert "items" not in [ParsedLoadJobFileName.parse(f).table_name for f in files]
+
+
+def _orders_schema(contract: TSchemaContract) -> Schema:
+    schema = Schema("orders")
+    schema.update_table(
+        new_table("orders", columns=[{"name": "id", "data_type": "bigint", "nullable": True}])
+    )
+    schema.update_table(
+        new_table(
+            "orders__items",
+            parent_table_name="orders",
+            columns=[{"name": "sku", "data_type": "text", "nullable": True}],
+        )
+    )
+    schema.set_schema_contract(contract)
+    return schema
+
+
+def _orders_items() -> List[StrAny]:
+    return [
+        {"id": 1, "items": [{"sku": "a"}]},
+        # new root column `customer` violates the columns contract
+        {"id": 2, "customer": "x", "items": [{"sku": "b"}]},
+        # new nested column `qty` violates the columns contract
+        {"id": 3, "items": [{"sku": "c", "qty": 1}]},
+        {"id": 4, "items": [{"sku": "d"}]},
+    ]
+
+
+def _normalized_rows(normalize: Normalize, load_id: str, table_name: str) -> List[StrAny]:
+    rows: List[StrAny] = []
+    for job_file in normalize.load_storage.list_new_jobs(load_id):
+        if ParsedLoadJobFileName.parse(job_file).table_name != table_name:
+            continue
+        with normalize.load_storage.normalized_packages.storage.open_file(job_file, "rb") as f:
+            for line in f:
+                if line.strip():
+                    rows.append(json.loads(line.decode("utf-8")))
+    return rows
+
+
+@pytest.mark.parametrize("caps", JSONL_CAPS, indirect=True)
+def test_normalize_reject_item_on_discard_row(
+    caps: DestinationCapabilitiesContext, raw_normalize_reject_item: Normalize
+) -> None:
+    """A `discard_row` contract violation in any row of a data item rejects all rows generated
+    from that item, while valid items load and the schema stays clean."""
+    load_id = extract_items(
+        raw_normalize_reject_item.normalize_storage,
+        _orders_items(),
+        _orders_schema({"columns": "discard_row"}),
+        "orders",
+    )
+    normalize_pending(raw_normalize_reject_item)
+
+    # orders 2 and 3 are rejected with all their rows, orders 1 and 4 load
+    rows = _normalized_rows(raw_normalize_reject_item, load_id, "orders")
+    assert {r["id"] for r in rows} == {1, 4}
+    rows = _normalized_rows(raw_normalize_reject_item, load_id, "orders__items")
+    assert {r["sku"] for r in rows} == {"a", "d"}
+    # columns discovered through rejected items did not enter the schema
+    schema = raw_normalize_reject_item.schema_storage["orders"]
+    assert "customer" not in schema.get_table_columns("orders")
+    assert "qty" not in schema.get_table_columns("orders__items")
+
+
+@pytest.mark.parametrize("caps", JSONL_CAPS, indirect=True)
+def test_normalize_discard_row_default_row_level(
+    caps: DestinationCapabilitiesContext, raw_normalize: Normalize
+) -> None:
+    """By default a `discard_row` violation drops only the violating row and its descendants."""
+    load_id = extract_items(
+        raw_normalize.normalize_storage,
+        _orders_items(),
+        _orders_schema({"columns": "discard_row"}),
+        "orders",
+    )
+    normalize_pending(raw_normalize)
+
+    # order 2 loses its root row (and descendants), order 3 loses only the nested row
+    rows = _normalized_rows(raw_normalize, load_id, "orders")
+    assert {r["id"] for r in rows} == {1, 3, 4}
+    rows = _normalized_rows(raw_normalize, load_id, "orders__items")
+    assert {r["sku"] for r in rows} == {"a", "d"}
+
+
+def _variant_schema(contract: TSchemaContract) -> Schema:
+    schema = Schema("orders")
+    schema.update_table(
+        new_table(
+            "orders",
+            columns=[
+                {"name": "id", "data_type": "bigint", "nullable": True},
+                {"name": "qty", "data_type": "bigint", "nullable": True},
+            ],
+        )
+    )
+    schema.set_schema_contract(contract)
+    return schema
+
+
+def _variant_items() -> List[StrAny]:
+    return [
+        {"id": 1, "qty": 5},
+        # `nick` evolves the schema, `qty` as text violates the data_type contract
+        {"id": 2, "nick": "x", "qty": "not a number"},
+        {"id": 3, "qty": 7},
+    ]
+
+
+@pytest.mark.parametrize("caps", JSONL_CAPS, indirect=True)
+def test_normalize_reject_item_rolls_back_schema(
+    caps: DestinationCapabilitiesContext, raw_normalize_reject_item: Normalize
+) -> None:
+    """Schema changes an item made under an `evolve` contract are rolled back when a later row
+    of the same item is rejected."""
+    load_id = extract_items(
+        raw_normalize_reject_item.normalize_storage,
+        _variant_items(),
+        _variant_schema({"columns": "evolve", "data_type": "discard_row"}),
+        "orders",
+    )
+    normalize_pending(raw_normalize_reject_item)
+
+    rows = _normalized_rows(raw_normalize_reject_item, load_id, "orders")
+    assert {r["id"] for r in rows} == {1, 3}
+    columns = raw_normalize_reject_item.schema_storage["orders"].get_table_columns("orders")
+    assert "nick" not in columns
+    assert "qty__v_text" not in columns
+
+
+@pytest.mark.parametrize("caps", JSONL_CAPS, indirect=True)
+def test_normalize_discard_row_default_keeps_evolved_columns(
+    caps: DestinationCapabilitiesContext, raw_normalize: Normalize
+) -> None:
+    """By default only the violating row is dropped and the evolved column stays in the schema."""
+    load_id = extract_items(
+        raw_normalize.normalize_storage,
+        _variant_items(),
+        _variant_schema({"columns": "evolve", "data_type": "discard_row"}),
+        "orders",
+    )
+    normalize_pending(raw_normalize)
+
+    rows = _normalized_rows(raw_normalize, load_id, "orders")
+    assert {r["id"] for r in rows} == {1, 3}
+    columns = raw_normalize.schema_storage["orders"].get_table_columns("orders")
+    assert "nick" in columns
+    assert "qty__v_text" not in columns
+
+
+@pytest.mark.parametrize("pool_workers", (1, 2), ids=("single worker", "parallel workers"))
+@pytest.mark.parametrize("caps", JSONL_CAPS, indirect=True)
+def test_normalize_reject_item_consistent_across_workers(
+    caps: DestinationCapabilitiesContext, raw_normalize_reject_item: Normalize, pool_workers: int
+) -> None:
+    """Rejected items produce no rows and no schema updates regardless of file batching and
+    the number of normalize workers."""
+    os.environ["DATA_WRITER__FILE_MAX_ITEMS"] = "2"
+    os.environ["NORMALIZE__DATA_WRITER__FILE_MAX_ITEMS"] = "2"
+    items = _orders_items() * 3
+    load_id = extract_items(
+        raw_normalize_reject_item.normalize_storage,
+        items,
+        _orders_schema({"columns": "discard_row"}),
+        "orders",
+        batch_size=1,
+    )
+    if pool_workers == 1:
+        normalize_pending(raw_normalize_reject_item)
+    else:
+        pool_config = PoolRunnerConfiguration(pool_type="process", workers=pool_workers)
+        with create_pool(pool_config) as pool:
+            raw_normalize_reject_item.run(pool)
+
+    rows = _normalized_rows(raw_normalize_reject_item, load_id, "orders")
+    assert sorted(r["id"] for r in rows) == [1, 1, 1, 4, 4, 4]
+    rows = _normalized_rows(raw_normalize_reject_item, load_id, "orders__items")
+    assert sorted(r["sku"] for r in rows) == ["a", "a", "a", "d", "d", "d"]
+    schema = raw_normalize_reject_item.schema_storage["orders"]
+    assert "customer" not in schema.get_table_columns("orders")
+    assert "qty" not in schema.get_table_columns("orders__items")
+
+
+@pytest.mark.parametrize("caps", JSONL_CAPS, indirect=True)
+def test_normalize_reject_item_rerun_consistent(
+    caps: DestinationCapabilitiesContext, raw_normalize_reject_item: Normalize
+) -> None:
+    """Re-running the same input rejects the same items and does not evolve the schema."""
+    schema = _orders_schema({"columns": "discard_row"})
+    extract_items(raw_normalize_reject_item.normalize_storage, _orders_items(), schema, "orders")
+    raw_normalize_reject_item.run(None)
+    schema_hash = raw_normalize_reject_item.schema_storage["orders"].stored_version_hash
+
+    load_id = extract_items(
+        raw_normalize_reject_item.normalize_storage, _orders_items(), schema, "orders"
+    )
+    raw_normalize_reject_item.run(None)
+
+    assert raw_normalize_reject_item.schema_storage["orders"].stored_version_hash == schema_hash
+    rows = _normalized_rows(raw_normalize_reject_item, load_id, "orders")
+    assert sorted(r["id"] for r in rows) == [1, 4]
+    rows = _normalized_rows(raw_normalize_reject_item, load_id, "orders__items")
+    assert sorted(r["sku"] for r in rows) == ["a", "d"]
+
+
+@pytest.mark.parametrize("caps", JSONL_CAPS, indirect=True)
+def test_normalize_reject_item_table_and_value_modes(
+    caps: DestinationCapabilitiesContext, raw_normalize_reject_item: Normalize
+) -> None:
+    """New tables filtered with `discard_row` reject the whole item, `discard_value` filters
+    keep the item and only drop the values."""
+    schema = _orders_schema({"tables": "discard_row", "columns": "discard_value"})
+    items = [
+        {"id": 1, "items": [{"sku": "a"}]},
+        # new column `customer`: value discarded, item kept
+        {"id": 2, "customer": "x", "items": [{"sku": "b"}]},
+        # new nested table `discounts`: item rejected
+        {"id": 3, "items": [{"sku": "c"}], "discounts": [{"code": "d1"}]},
+        {"id": 4, "items": [{"sku": "d"}]},
+        # hits the previously registered `discounts` table filter: item rejected
+        {"id": 5, "items": [{"sku": "e"}], "discounts": [{"code": "d2"}]},
+    ]
+    load_id = extract_items(raw_normalize_reject_item.normalize_storage, items, schema, "orders")
+    normalize_pending(raw_normalize_reject_item)
+
+    rows = _normalized_rows(raw_normalize_reject_item, load_id, "orders")
+    assert {r["id"] for r in rows} == {1, 2, 4}
+    # order 2 was loaded without the discarded value
+    assert all("customer" not in r for r in rows)
+    rows = _normalized_rows(raw_normalize_reject_item, load_id, "orders__items")
+    assert {r["sku"] for r in rows} == {"a", "b", "d"}
+    schema = raw_normalize_reject_item.schema_storage["orders"]
+    assert "customer" not in schema.get_table_columns("orders")
+    assert "orders__discounts" not in schema.tables
+
+
+@pytest.mark.parametrize("caps", JSONL_CAPS, indirect=True)
+def test_normalize_reject_item_removes_created_tables(
+    caps: DestinationCapabilitiesContext, raw_normalize_reject_item: Normalize
+) -> None:
+    """Tables created by a rejected item are removed from the schema on rollback."""
+    items = [
+        {"id": 1, "items": [{"sku": "a"}]},
+        # `tags` creates a new table before `qty` violates the columns contract
+        {"id": 2, "tags": ["t1"], "items": [{"sku": "b", "qty": 1}]},
+        {"id": 3, "items": [{"sku": "c"}]},
+    ]
+    load_id = extract_items(
+        raw_normalize_reject_item.normalize_storage,
+        items,
+        _orders_schema({"columns": "discard_row"}),
+        "orders",
+    )
+    normalize_pending(raw_normalize_reject_item)
+
+    rows = _normalized_rows(raw_normalize_reject_item, load_id, "orders")
+    assert {r["id"] for r in rows} == {1, 3}
+    schema = raw_normalize_reject_item.schema_storage["orders"]
+    assert "orders__tags" not in schema.tables
+    assert "qty" not in schema.get_table_columns("orders__items")
+
+
+@pytest.mark.parametrize("caps", JSONL_CAPS, indirect=True)
+def test_normalize_reject_item_list_wrapped_records_are_independent(
+    caps: DestinationCapabilitiesContext, raw_normalize_reject_item: Normalize
+) -> None:
+    """Records written together as a list stay independent items: a violating record is rejected
+    while the other records of the same chunk load normally."""
+    schema = _orders_schema({"columns": "discard_row"})
+    load_id = extract_items(
+        raw_normalize_reject_item.normalize_storage,
+        [
+            {"id": 1, "items": [{"sku": "a"}]},
+            {"id": 2, "customer": "x", "items": [{"sku": "b"}]},
+            {"id": 3, "items": [{"sku": "c"}]},
+        ],
+        schema,
+        "orders",
+        batch_size=3,
+    )
+    normalize_pending(raw_normalize_reject_item)
+
+    rows = _normalized_rows(raw_normalize_reject_item, load_id, "orders")
+    assert {r["id"] for r in rows} == {1, 3}
+    rows = _normalized_rows(raw_normalize_reject_item, load_id, "orders__items")
+    assert {r["sku"] for r in rows} == {"a", "c"}
+    schema = raw_normalize_reject_item.schema_storage["orders"]
+    assert "customer" not in schema.get_table_columns("orders")
+    assert "orders__value" not in schema.tables
 
 
 @pytest.mark.parametrize("caps", INSERT_CAPS + JSONL_CAPS, indirect=True)

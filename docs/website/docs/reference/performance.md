@@ -503,6 +503,15 @@ start_method="spawn"
 
 :::
 
+#### Rejecting whole data items on schema contract violations
+
+By default a `discard_row` [schema contract](../general-usage/schema-contracts.md) drops only the violating table row. Set `reject_item_on_discard_row` to discard every row generated from a root record when any of its rows violates a `discard_row` rule; columns and tables discovered through the rejected record are rolled back and never enter the schema. This applies to Python dict/list items processed by the JSON normalizer.
+
+```toml
+[normalize]
+reject_item_on_discard_row=true
+```
+
 ### Load
 
 The **load** stage uses a thread pool for parallelization. Loading is input/output-bound. `dlt` avoids any processing of the content of the load package produced by the normalizer. By default, loading happens in 20 threads, each loading a single file.

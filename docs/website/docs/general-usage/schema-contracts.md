@@ -66,6 +66,7 @@ You can change the contract on the **source** instance via the `schema_contract`
 1. Contracts are applied **after names of tables and columns are normalized**.
 2. A contract defined on a resource is applied to all root tables and nested tables created by that resource.
 3. `discard_row` works on the table level. For example, if you have two tables in a nested relationship, i.e., *users* and *users__addresses*, and the contract is violated in the *users__addresses* table, the row of that table is discarded while the parent row in the *users* table will be loaded.
+4. Set `reject_item_on_discard_row` in the [normalize configuration](../reference/performance.md#normalize) (or the `NORMALIZE__REJECT_ITEM_ON_DISCARD_ROW` environment variable) to `True` to reject the whole data item instead: when any row generated from a root record violates a `discard_row` rule, none of the rows of that record (across all tables) are loaded, and columns and tables discovered through the rejected record are rolled back and never enter the schema. This applies to Python dict/list items processed by the JSON normalizer.
 
 ### Use Pydantic models for data validation
 

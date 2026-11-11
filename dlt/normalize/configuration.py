@@ -23,6 +23,11 @@ class ItemsNormalizerConfiguration(BaseConfiguration):
 class NormalizeConfiguration(PoolRunnerConfiguration):
     pool_type: TPoolType = "process"
     destination_capabilities: DestinationCapabilitiesContext = None  # injectable
+    reject_item_on_discard_row: bool = False
+    """When true, all rows of a data item are discarded when any of its rows violates
+    a `discard_row` schema contract rule, and schema changes discovered from the rejected item
+    are rolled back. Applies to Python object (JSONL) items. When false, only the violating
+    row is discarded."""
     _schema_storage_config: SchemaStorageConfiguration = None
     _normalize_storage_config: NormalizeStorageConfiguration = None
     _load_storage_config: LoadStorageConfiguration = None
